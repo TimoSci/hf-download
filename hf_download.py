@@ -18,11 +18,17 @@ How it stays safe:
   * .hfdl-manifest.json remembers verified files (hash, size, mtime) so
     restarts don't re-hash everything. Use --verify to re-hash anyway.
 
-Only the Python standard library is needed. For gated/private repos set
-HF_TOKEN (or log in with `huggingface-cli login`).
+Once everything is downloaded, the folder is turned into a git clone of the
+repo (needs git; --nogit skips this, --togit converts an earlier download).
+Only the small git history is fetched for that - the large files are the ones
+already on disk, and they are neither downloaded nor hashed a second time.
+
+Apart from git, only the Python standard library is needed. For gated/private
+repos set HF_TOKEN (or log in with `huggingface-cli login`).
 """
 
 import argparse
+import base64
 import errno
 import glob
 import hashlib
@@ -31,6 +37,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -348,13 +355,34 @@ def hash_file(path, f):
 
 # ---------------------------------------------------------------- download
 
-def download_file(f, url, root, token, manifest, progress, verify, retries):
-    """Fetch one file. Returns 'ok', 'skipped' or 'interrupted'; raises Fatal."""
+def dest_path(root, f):
+    """Where f belongs on disk; refuses anything that would land outside root."""
     dest = root / f.path
     # Belt and braces on top of the listing check: also catches symlinks that
     # lead out of the folder and Windows drive-style names like "C:x".
     if not dest.resolve().is_relative_to(root):
         raise Fatal(f"{f.path}: would be written outside {root}, skipping")
+    return dest
+
+
+def already_complete(f, dest, manifest, verify):
+    """True if dest is a verified copy of f. Hashes it unless the manifest vouches for it."""
+    if not dest.is_file():
+        return False
+    st = dest.stat()
+    if st.st_size != f.size:
+        return False
+    if not verify and manifest.matches(f, st):
+        return True
+    if hash_file(dest, f).hexdigest() == f.digest and not STOP.is_set():
+        manifest.record(f, st)
+        return True
+    return False
+
+
+def download_file(f, url, root, token, manifest, progress, verify, retries):
+    """Fetch one file. Returns 'ok', 'skipped' or 'interrupted'; raises Fatal."""
+    dest = dest_path(root, f)
     part = dest.with_name(f"{dest.name}.{f.digest[:12]}.part")
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -363,18 +391,12 @@ def download_file(f, url, root, token, manifest, progress, verify, retries):
         if Path(stale) != part:
             os.unlink(stale)
 
+    if already_complete(f, dest, manifest, verify):
+        progress.add(f.size)
+        return "skipped"
+    if STOP.is_set():
+        return "interrupted"
     if dest.exists():
-        st = dest.stat()
-        if st.st_size == f.size:
-            if not verify and manifest.matches(f, st):
-                progress.add(f.size)
-                return "skipped"
-            if hash_file(dest, f).hexdigest() == f.digest:
-                manifest.record(f, st)
-                progress.add(f.size)
-                return "skipped"
-            if STOP.is_set():
-                return "interrupted"
         progress.log(f"{f.path}: existing file is corrupt or outdated, re-downloading")
         dest.unlink()
 
@@ -450,6 +472,111 @@ def download_file(f, url, root, token, manifest, progress, verify, retries):
             STOP.wait(delay)
 
 
+# ---------------------------------------------------------------- git
+
+def git_convert(root, kind, repo, rev, commit, token):
+    """Turn the fully downloaded folder into a git clone checked out at `commit`.
+
+    Only git's own objects are fetched (history, small files, LFS pointers).
+    Every file on disk has just been verified against that commit, so the
+    index is filled in without making git re-read the large files.
+    """
+    git = shutil.which("git")
+    if not git:
+        raise Fatal("git is not installed")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", commit):
+        raise Fatal(f"unexpected commit id from server: {commit!r}")
+    url = f"{ENDPOINT}/{'' if kind == 'models' else kind + '/'}{repo}"
+    say = lambda msg: print(msg, file=sys.stderr, flush=True)
+
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_LFS_SKIP_SMUDGE="1")
+    auth_env = dict(env)
+    if token:   # for this fetch only, via the environment so it is not visible in `ps`
+        n = int(env.get("GIT_CONFIG_COUNT", "0") or 0)
+        basic = base64.b64encode(f"hf_user:{token}".encode()).decode()
+        auth_env.update({"GIT_CONFIG_COUNT": str(n + 1),
+                         f"GIT_CONFIG_KEY_{n}": f"http.{ENDPOINT}/.extraHeader",
+                         f"GIT_CONFIG_VALUE_{n}": f"Authorization: Basic {basic}"})
+
+    def run(*cmd, check=True, env=env, config=()):
+        full = [git] + [x for kv in config for x in ("-c", kv)] + list(cmd)
+        r = subprocess.run(full, cwd=root, env=env, capture_output=True, text=True)
+        if check and r.returncode:
+            raise Fatal(f"git {cmd[0]} failed: {(r.stderr or r.stdout).strip()}")
+        return r
+
+    say(f"turning {root.name} into a git clone of {url} ...")
+    if not (root / ".git").exists():    # checked by path: a parent folder may be a repo too
+        run("init", "-q")
+    origin = run("remote", "get-url", "origin", check=False)
+    if origin.returncode:
+        run("remote", "add", "origin", url)
+    elif origin.stdout.strip().rstrip("/").removesuffix(".git") != url:
+        raise Fatal(f"{root} is already a git repo with another origin "
+                    f"({origin.stdout.strip()}); leaving it untouched")
+
+    run("fetch", "-q", "origin", env=auth_env)
+    if run("cat-file", "-e", commit + "^{commit}", check=False).returncode:
+        run("fetch", "-q", "origin", commit, env=auth_env)     # commit not on any branch/tag
+
+    head = run("rev-parse", "-q", "--verify", "HEAD", check=False).stdout.strip()
+    if not head:
+        # New repo. If the page was a branch, check that branch out and make it
+        # track origin; for a tag or commit id, leave a detached HEAD.
+        if run("rev-parse", "-q", "--verify", f"refs/remotes/origin/{rev}", check=False).returncode == 0:
+            run("symbolic-ref", "HEAD", f"refs/heads/{rev}")
+            run("update-ref", "HEAD", commit)
+            run("config", f"branch.{rev}.remote", "origin")
+            run("config", f"branch.{rev}.merge", f"refs/heads/{rev}")
+        else:
+            run("update-ref", "--no-deref", "HEAD", commit)
+    elif head != commit:
+        # The folder was a clone already and the repo has moved on since.
+        if run("merge-base", "--is-ancestor", head, commit, check=False).returncode:
+            raise Fatal(f"the git repo in {root} has commits that are not in {commit[:12]}; "
+                        "leaving its git state untouched")
+        run("update-ref", "HEAD", commit)
+
+    run("remote", "set-head", "origin", "--auto", check=False, env=auth_env)  # origin/HEAD, as clone does
+
+    # Point the index at the commit without touching the files on disk.
+    run("read-tree", commit)
+
+    exclude = root / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(exist_ok=True)
+    have = exclude.read_text() if exclude.exists() else ""
+    missing = [pat for pat in (MANIFEST, MANIFEST + ".tmp", "*.part") if pat not in have.split("\n")]
+    if missing:
+        exclude.write_text(have + ("" if have.endswith("\n") or not have else "\n")
+                           + "\n".join(missing) + "\n")
+
+    # Let git record each file as unchanged. Normally it would push every LFS
+    # file through `git lfs clean`, i.e. read and hash all of it again (and
+    # git-lfs would keep a second copy under .git/lfs). The checksums were
+    # verified moments ago, so for this one command the LFS filter is replaced
+    # by one that answers with the pointer stored in the commit. Small non-LFS
+    # files are still hashed by git itself. The user's global/system git config
+    # is hidden for this command, because git-lfs registers a filter there that
+    # would take precedence.
+    time.sleep(1.1)     # files as new as the index would be re-checked by git later
+    bare_env = dict(env, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+                    GIT_CONFIG_NOSYSTEM="1")
+    run("update-index", "-q", "--refresh", check=False, env=bare_env,
+        config=(f"filter.lfs.clean=git cat-file blob {commit}:%f", "filter.lfs.required=false"))
+
+    status = run("status", "--porcelain").stdout.splitlines()
+    branch = run("symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip()
+    say(f"git clone ready: {'branch ' + branch if branch else 'detached HEAD'} at {commit[:12]}")
+    if status:
+        say(f"note: git reports {len(status)} difference(s) from that commit:")
+        for line in status[:10]:
+            say("  " + line)
+    if run("lfs", "version", check=False).returncode:
+        say("note: git-lfs is not installed. The folder is a valid clone, but install git-lfs "
+            "before running\n      git pull/checkout in it, or large files will be replaced "
+            "by small pointer files.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("url", help="Hugging Face page URL, e.g. https://huggingface.co/org/name/tree/main")
@@ -459,6 +586,11 @@ def main():
                     help="consecutive attempts without any progress before giving up on a file")
     ap.add_argument("--verify", action="store_true",
                     help="re-hash files that are already complete instead of trusting the manifest")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--nogit", action="store_true",
+                      help="only download the files; don't turn the folder into a git clone")
+    mode.add_argument("--togit", action="store_true",
+                      help="download nothing; turn an existing, complete download into a git clone")
     args = ap.parse_args()
 
     token = find_token()
@@ -469,6 +601,20 @@ def main():
 
     folder = repo.replace("/", "__") + ("" if rev == "main" else f"@{rev.replace('/', '_')}")
     root = Path(args.dir, folder).resolve()
+    if args.togit:
+        if sub:
+            raise Fatal("a subfolder download cannot become a git clone; use the repo's main page URL")
+        if not root.is_dir():
+            raise Fatal(f"{root} does not exist, so there is nothing to convert")
+        manifest = Manifest(root / MANIFEST)
+        print(f"checking {len(files)} files in {root} ...", file=sys.stderr)
+        bad = [f.path for f in files if not already_complete(f, dest_path(root, f), manifest, args.verify)]
+        if bad:
+            raise Fatal(f"{len(bad)} of {len(files)} files are missing, incomplete or outdated "
+                        f"(e.g. {bad[0]}); run without --togit to finish the download first")
+        git_convert(root, kind, repo, rev, commit, token)
+        return 0
+
     root.mkdir(parents=True, exist_ok=True)
     manifest = Manifest(root / MANIFEST)
     progress = Progress(sum(f.size for f in files), len(files))
@@ -516,6 +662,19 @@ def main():
             print("  " + msg, file=sys.stderr)
         return 1
     print(f"done: all {len(files)} files downloaded and verified in {root}", file=sys.stderr)
+    if args.nogit:
+        return 0
+    if sub:
+        print("note: only a subfolder was downloaded, so it was not turned into a git clone",
+              file=sys.stderr)
+        return 0
+    try:
+        git_convert(root, kind, repo, rev, commit, token)
+    except Fatal as e:
+        print(f"error: the files are downloaded and verified, but making the folder a git clone "
+              f"failed:\n  {e}\nRun again with --togit to retry, or with --nogit to skip this step.",
+              file=sys.stderr)
+        return 1
     return 0
 
 
@@ -524,3 +683,5 @@ if __name__ == "__main__":
         sys.exit(main())
     except Fatal as e:
         sys.exit(f"error: {e}")
+    except KeyboardInterrupt:
+        sys.exit(130)
