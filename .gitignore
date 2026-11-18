@@ -1,0 +1,10 @@
+# Folders created by hf_download.py (named <owner>__<repo>[@<revision>])
+/*__*/
+
+# Downloader state, in case a download ends up somewhere else
+*.part
+.hfdl-manifest.json
+
+# Python and editor leftovers
+__pycache__/
+*.swp

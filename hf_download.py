@@ -137,7 +137,7 @@ def parse_url(url):
             sub = parts[i + 2:] if marker == "tree" else []
             parts = parts[:i]
             break
-    if not 1 <= len(parts) <= 2:
+    if not 1 <= len(parts) <= 2 or any(p in (".", "..") for p in parts):
         raise Fatal(f"cannot find a repo name in {url!r}")
     return kind, "/".join(parts), rev, "/".join(sub)
 
@@ -351,6 +351,10 @@ def hash_file(path, f):
 def download_file(f, url, root, token, manifest, progress, verify, retries):
     """Fetch one file. Returns 'ok', 'skipped' or 'interrupted'; raises Fatal."""
     dest = root / f.path
+    # Belt and braces on top of the listing check: also catches symlinks that
+    # lead out of the folder and Windows drive-style names like "C:x".
+    if not dest.resolve().is_relative_to(root):
+        raise Fatal(f"{f.path}: would be written outside {root}, skipping")
     part = dest.with_name(f"{dest.name}.{f.digest[:12]}.part")
     dest.parent.mkdir(parents=True, exist_ok=True)
 
