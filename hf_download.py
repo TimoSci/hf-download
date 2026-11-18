@@ -127,6 +127,21 @@ class RepoFile:
         return hashlib.sha1(b"blob %d\0" % self.size)  # git blob id
 
 
+_HFS_IGNORABLE = dict.fromkeys(
+    [0x200C, 0x200D, 0x200E, 0x200F, 0xFEFF, *range(0x202A, 0x202F), *range(0x206A, 0x2070)])
+
+
+def is_dotgit(name):
+    """True if a path component could be taken for ".git" by some filesystem.
+
+    Covers case-insensitive names, the Unicode characters HFS+ ignores, and the
+    NTFS forms (trailing dots/spaces, the short name GIT~1) - the same cases
+    git itself refuses to check out.
+    """
+    name = name.translate(_HFS_IGNORABLE).lower().rstrip(" .")
+    return name == ".git" or re.fullmatch(r"git~\d+", name) is not None
+
+
 def parse_url(url):
     """-> (kind, repo_id, revision, subfolder)"""
     if "://" not in url:
@@ -165,8 +180,13 @@ def list_files(kind, repo, rev, sub, token):
             if e.get("type") != "file":
                 continue
             path = e["path"]
-            if path.startswith("/") or ".." in path.split("/") or "\\" in path:
+            parts = path.split("/")
+            if path.startswith("/") or ".." in parts or "\\" in path:
                 raise Fatal(f"refusing unsafe path from server: {path!r}")
+            if any(is_dotgit(p) for p in parts):
+                # A file under .git could plant git config or hooks that run
+                # commands as soon as git is used in the folder.
+                raise Fatal(f"refusing repo with a file inside a .git folder: {path!r}")
             lfs = e.get("lfs")
             if lfs:
                 files.append(RepoFile(path, lfs.get("size", e["size"]), "sha256", lfs["oid"]))
@@ -489,14 +509,23 @@ def git_convert(root, kind, repo, rev, commit, token):
     url = f"{ENDPOINT}/{'' if kind == 'models' else kind + '/'}{repo}"
     say = lambda msg: print(msg, file=sys.stderr, flush=True)
 
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_LFS_SKIP_SMUDGE="1")
-    auth_env = dict(env)
-    if token:   # for this fetch only, via the environment so it is not visible in `ps`
-        n = int(env.get("GIT_CONFIG_COUNT", "0") or 0)
+    def with_config(base, pairs):
+        """Copy of environment `base` that passes extra `git -c key=value` settings."""
+        n = int(base.get("GIT_CONFIG_COUNT", "0") or 0)
+        out = dict(base, GIT_CONFIG_COUNT=str(n + len(pairs)))
+        for i, (key, value) in enumerate(pairs, n):
+            out[f"GIT_CONFIG_KEY_{i}"], out[f"GIT_CONFIG_VALUE_{i}"] = key, value
+        return out
+
+    # No hooks and no fsmonitor command for the git calls made here, whatever a
+    # .git folder that is already present may say.
+    env = with_config(dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_LFS_SKIP_SMUDGE="1"),
+                      [("core.hooksPath", os.devnull), ("core.fsmonitor", "false")])
+    auth_env = env
+    if token:   # for the fetch only, via the environment so it is not visible in `ps`
         basic = base64.b64encode(f"hf_user:{token}".encode()).decode()
-        auth_env.update({"GIT_CONFIG_COUNT": str(n + 1),
-                         f"GIT_CONFIG_KEY_{n}": f"http.{ENDPOINT}/.extraHeader",
-                         f"GIT_CONFIG_VALUE_{n}": f"Authorization: Basic {basic}"})
+        auth_env = with_config(env, [(f"http.{ENDPOINT}/.extraHeader",
+                                      f"Authorization: Basic {basic}")])
 
     def run(*cmd, check=True, env=env, config=()):
         full = [git] + [x for kv in config for x in ("-c", kv)] + list(cmd)
