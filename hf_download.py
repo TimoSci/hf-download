@@ -135,10 +135,11 @@ def is_dotgit(name):
     """True if a path component could be taken for ".git" by some filesystem.
 
     Covers case-insensitive names, the Unicode characters HFS+ ignores, and the
-    NTFS forms (trailing dots/spaces, the short name GIT~1) - the same cases
-    git itself refuses to check out.
+    NTFS forms (trailing dots/spaces, the short name GIT~1, and a ":stream"
+    suffix as in ".git::$INDEX_ALLOCATION") - the same cases git itself
+    refuses to check out.
     """
-    name = name.translate(_HFS_IGNORABLE).lower().rstrip(" .")
+    name = name.split(":", 1)[0].translate(_HFS_IGNORABLE).lower().rstrip(" .")
     return name == ".git" or re.fullmatch(r"git~\d+", name) is not None
 
 
