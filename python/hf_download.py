@@ -184,6 +184,9 @@ def list_files(kind, repo, rev, sub, token):
             parts = path.split("/")
             if path.startswith("/") or ".." in parts or "\\" in path:
                 raise Fatal(f"refusing unsafe path from server: {path!r}")
+            # Control characters would be sent to the terminal as escape codes.
+            if any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in path):
+                raise Fatal(f"refusing path with control characters: {path!r}")
             if any(is_dotgit(p) for p in parts):
                 # A file under .git could plant git config or hooks that run
                 # commands as soon as git is used in the folder.

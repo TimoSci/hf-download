@@ -254,6 +254,10 @@ def list_files(kind, repo, rev, sub, token)
       if path.start_with?("/") || parts.include?("..") || path.include?("\\")
         raise Fatal, "refusing unsafe path from server: #{path.inspect}"
       end
+      # Control characters would be sent to the terminal as escape codes.
+      if path.match?(/[\u0000-\u001f\u007f-\u009f]/)
+        raise Fatal, "refusing path with control characters: #{path.inspect}"
+      end
       if parts.any? { |p| dotgit?(p) }
         # A file under .git could plant git config or hooks that run
         # commands as soon as git is used in the folder.
