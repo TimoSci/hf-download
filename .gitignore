@@ -1,5 +1,5 @@
 # Folders created by hf_download.py (named <owner>__<repo>[@<revision>])
-/*__*/
+*__*/
 
 # Downloader state, in case a download ends up somewhere else
 *.part

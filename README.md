@@ -1,20 +1,31 @@
-# hf_download.py
+# hf-download
 
 Downloads every file of a Hugging Face repo page into its own folder. The
 download can be interrupted at any point and resumed, and every file is checked
 against the checksum published by the Hub. When the download is complete, the
 folder is turned into a git clone of the repo.
 
-Needs Python 3.9 or newer and no Python packages. The git step needs `git`
-(2.32 or newer); use `--nogit` if you don't want it.
+There are two versions with the same options and the same behaviour:
+
+| Version | Script | Needs |
+| --- | --- | --- |
+| Python | `python/hf_download.py` | Python 3.9 or newer, no packages |
+| Ruby | `ruby/hf_download.rb` | Ruby 3 (tested with 3.2), no gems |
+
+Both use the same folder names, partial files and manifest, so a download
+started with one can be resumed or converted with the other. The examples
+below use the Python version; for Ruby, replace `python3 python/hf_download.py`
+with `ruby ruby/hf_download.rb`.
+
+The git step needs `git` (2.32 or newer); use `--nogit` if you don't want it.
 
 ## Usage
 
 ```
-python3 hf_download.py https://huggingface.co/zai-org/GLM-5.3-Flash/tree/main
+python3 python/hf_download.py https://huggingface.co/zai-org/GLM-5.3-Flash/tree/main
 ```
 
-This creates `./zai-org__GLM-5.3-Flash`, downloads all files into it and then
+This creates `./zai-org__GLM-5.3-Flash` in the current directory, downloads all files into it and then
 makes the folder a git clone. After a crash, a network failure or Ctrl-C, run
 the same command again: finished files are skipped and partial files continue
 from the last byte on disk.
@@ -22,14 +33,14 @@ from the last byte on disk.
 To get only the files, without git:
 
 ```
-python3 hf_download.py --nogit https://huggingface.co/zai-org/GLM-5.3-Flash/tree/main
+python3 python/hf_download.py --nogit https://huggingface.co/zai-org/GLM-5.3-Flash/tree/main
 ```
 
 To turn a folder downloaded earlier (with `--nogit`, or by an older version of
 this script) into a git clone, without downloading anything:
 
 ```
-python3 hf_download.py --togit https://huggingface.co/zai-org/GLM-5.3-Flash/tree/main
+python3 python/hf_download.py --togit https://huggingface.co/zai-org/GLM-5.3-Flash/tree/main
 ```
 
 The URL can be a model, dataset (`/datasets/...`) or Space (`/spaces/...`)
