@@ -392,8 +392,7 @@ class Progress
       @rate.sample(now)
       @active.each_value { |entry| entry[2].sample(now) }
       if @tty
-        erase
-        draw
+        render
       else
         pct = @total.positive? ? 100.0 * @done / @total : 100.0
         $stderr.puts format("%d/%d files  %s/%s  %5.1f%%  %s/s  5m avg %s/s",
@@ -409,30 +408,35 @@ class Progress
   # The methods below expect @lock to be held.
 
   def println(msg)
-    erase
-    $stderr.write("#{msg}\n")
-    draw
-    $stderr.flush
+    render(msg)
   end
 
-  def erase
-    return unless @tty && @drawn.positive?
-
-    up = @drawn > 1 ? "\e[#{@drawn - 1}A" : ""
-    $stderr.write("\r#{up}\e[J")
-    @drawn = 0
-  end
-
-  def draw
-    return unless @tty
-
+  # Redraw the live region, optionally printing a permanent line above it.
+  #
+  # The new frame overwrites the old one in place and goes out in a single
+  # write. Erasing the region first would leave it blank for a moment, which
+  # shows up as flashing.
+  def render(msg = nil)
+    unless @tty
+      unless msg.nil?
+        $stderr.write("#{msg}\n")
+        $stderr.flush
+      end
+      return
+    end
     cols, rows = terminal_size
     now = mono
     lines = @active.first([rows - 2, 1].max).map do |path, (done, size, rate)|
       bar_line(path, done, size, rate, now, cols - 1)
     end
     lines << bar_line("TOTAL #{@files_done}/#{@nfiles} files", @done, @total, @rate, now, cols - 1)
-    $stderr.write(lines.join("\n"))
+    out = +""
+    # back to the first line of the old frame
+    out << "\r" << (@drawn > 1 ? "\e[#{@drawn - 1}A" : "") if @drawn.positive?
+    out << msg << "\e[K\n" unless msg.nil?
+    # \e[K clears the rest of each line, \e[J whatever is left below.
+    out << lines.join("\e[K\n") << "\e[K\e[J"
+    $stderr.write(out)
     $stderr.flush
     @drawn = lines.length
   end

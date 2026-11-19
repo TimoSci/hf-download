@@ -297,8 +297,7 @@ class Progress:
             for entry in self.active.values():
                 entry[2].sample(now)
             if self.tty:
-                self._erase()
-                self._draw()
+                self._render()
             else:
                 pct = 100 * self.done / self.total if self.total else 100
                 print(f"{self.files_done}/{self.nfiles} files  {human(self.done)}/"
@@ -310,19 +309,19 @@ class Progress:
     # The methods below expect self.lock to be held.
 
     def _println(self, msg):
-        self._erase()
-        sys.stderr.write(msg + "\n")
-        self._draw()
-        sys.stderr.flush()
+        self._render(msg)
 
-    def _erase(self):
-        if self.tty and self.drawn:
-            up = f"\033[{self.drawn - 1}A" if self.drawn > 1 else ""
-            sys.stderr.write("\r" + up + "\033[J")
-            self.drawn = 0
+    def _render(self, msg=None):
+        """Redraw the live region, optionally printing a permanent line above it.
 
-    def _draw(self):
+        The new frame overwrites the old one in place and goes out in a single
+        write. Erasing the region first would leave it blank for a moment,
+        which shows up as flashing.
+        """
         if not self.tty:
+            if msg is not None:
+                sys.stderr.write(msg + "\n")
+                sys.stderr.flush()
             return
         cols, rows = shutil.get_terminal_size()
         now = time.monotonic()
@@ -330,7 +329,14 @@ class Progress:
                  for path, (done, size, rate) in list(self.active.items())[:max(rows - 2, 1)]]
         lines.append(bar_line(f"TOTAL {self.files_done}/{self.nfiles} files", self.done, self.total,
                               self.rate, now, cols - 1))
-        sys.stderr.write("\n".join(lines))
+        out = []
+        if self.drawn:      # back to the first line of the old frame
+            out.append("\r" + (f"\033[{self.drawn - 1}A" if self.drawn > 1 else ""))
+        if msg is not None:
+            out.append(msg + "\033[K\n")
+        # \033[K clears the rest of each line, \033[J whatever is left below.
+        out.append("\033[K\n".join(lines) + "\033[K\033[J")
+        sys.stderr.write("".join(out))
         sys.stderr.flush()
         self.drawn = len(lines)
 
